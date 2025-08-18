@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""
+RV1106 Control System for:
+- 2x 8-way relay boards (16 relays total)
+- Arduino Nano with 16 WS2812B LEDs via UART1
+- Each relay maps to one LED (Green=ON, Red=OFF)
+"""
+
+from flask import Flask, jsonify, render_template_string, request
+import os
+import serial
+import json
+import time
+import threading
+from datetime import datetime
+
+app = Flask(__name__)
+
+# GPIO Pin Mappings for Relays
+# Updated with working pin configuration
+RELAY_PINS = {
+    "board1": {
+        1: 65, 2: 66, 3: 55, 4: 54,
+        5: 53, 6: 52, 7: 58, 8: 59
+    },
+    "board2": {
+        1: 73, 2: 48, 3: 49, 4: 50,
+        5: 51, 6: 72, 7: 56, 8: 57
+    }
+}
+
+# UART Configuration for Arduino communication
+UART_PORT = '/dev/ttyS1'  # UART1 on RV1106
+UART_BAUDRATE = 9600
+
+# Global serial connection
+arduino_serial = None
+serial_lock = threading.Lock()
+
+# Relay states (for tracking)
+relay_states = {
+    "board1": {i: False for i in range(1, 9)},
+    "board2": {i: False for i in range(1, 9)}
+}
+
+# Relay names - CUSTOMIZE THESE!
+RELAY_NAMES = {
+    "board1": {
+        1: "Living Room Light",
+        2: "Kitchen Light", 
+        3: "Bedroom 1",
+        4: "Bedroom 2",
+        5: "Garage Door",
+        6: "Front Porch",
+        7: "Backyard",
+        8: "Bathroom"
+    },
+    "board2": {
+        1: "Pool Pump",
+        2: "Sprinklers",
+        3: "AC Unit",
+        4: "Water Heater",
+        5: "Security Light",
+        6: "Workshop",
+        7: "Attic Fan",
+        8: "Spare"
+    }
+}
+def get_led_for_relay(board, relay):
+    """Get LED index for a given relay"""
+    if board == "board1":
+        return relay - 1  # Relays 1-8 → LEDs 0-7
+    elif board == "board2":
+        return relay + 7  # Relays 1-8 → LEDs 8-15
+    return None
+
+# HTML Template with modern UI
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Power Distribution Board Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .control-panel {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        h2 {
+            color: #333;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #667eea;
+        }
+        
+        .relay-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .relay-button {
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            position: relative;
+        }
+        
+        .relay-button.off {
+            background: #e0e0e0;
+            color: #666;
+        }
+        
+        .relay-button.on {
+            background: #4caf50;
+            color: white;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 4px 6px rgba(76, 175, 80, 0.4); }
+            50% { box-shadow: 0 4px 20px rgba(76, 175, 80, 0.6); }
+            100% { box-shadow: 0 4px 6px rgba(76, 175, 80, 0.4); }
+        }
+        
+        .relay-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+        }
+        
+        .led-indicator {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: 1px solid rgba(0,0,0,0.2);
+        }
+        
+        .led-indicator.green {
+            background: #00ff00;
+            box-shadow: 0 0 5px #00ff00;
+        }
+        
+        .led-indicator.red {
+            background: #ff0000;
+            box-shadow: 0 0 5px #ff0000;
+        }
+        
+        .led-grid {
+            display: grid;
+            grid-template-columns: repeat(8, 1fr);
+            gap: 10px;
+            margin: 20px 0;
+            padding: 20px;
+            background: #f5f5f5;
+            border-radius: 10px;
+        }
+        
+        .led-pixel {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            border: 2px solid #ddd;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: bold;
+            color: white;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
+        }
+        
+        .action-button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin: 5px;
+        }
+        
+        .action-button.primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .action-button.secondary {
+            background: #f50057;
+            color: white;
+        }
+        
+        .action-button.warning {
+            background: #ff9800;
+            color: white;
+        }
+        
+        .action-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+        }
+        
+        .status-bar {
+            background: #f0f0f0;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 20px;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        
+        .info-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            background: #667eea;
+            color: white;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        
+        .connection-status {
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: bold;
+        }
+        
+        .connection-status.connected {
+            background: #c8e6c9;
+            color: #2e7d32;
+        }
+        
+        .connection-status.disconnected {
+            background: #ffcdd2;
+            color: #c62828;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚡ Power Distribution Board Control</h1>
+        
+        <div id="connection-status" class="control-panel connection-status disconnected">
+            Checking Arduino connection...
+        </div>
+        
+        <!-- All DC Outputs -->
+        <div class="control-panel">
+            <h2>DC Power Outputs <span class="info-badge">16 Channels</span></h2>
+            <div class="relay-grid" id="all-relays">
+                <!-- Populated by JavaScript -->
+            </div>
+            <div>
+                <button class="action-button primary" onclick="setAllRelays(true)">All ON</button>
+                <button class="action-button warning" onclick="setAllRelays(false)">All OFF</button>
+            </div>
+        </div>
+        
+        <!-- System Controls -->
+        <div class="control-panel">
+            <h2>System Controls</h2>
+            
+            <div class="action-button-group" style="margin-top: 20px;">
+                <button class="action-button warning" onclick="testSequence()">Run Test Sequence</button>
+                <button class="action-button secondary" onclick="emergencyStop()">Emergency Stop (All OFF)</button>
+            </div>
+            
+            <div class="status-bar" id="status">
+                Status: Ready
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Relay states
+        let relayStates = {
+            board1: {},
+            board2: {}
+        };
+        
+        // Initialize relay buttons
+        function initializeRelays() {
+            const container = document.getElementById('all-relays');
+            let dcNumber = 1;
+            
+            for (let board of ['board1', 'board2']) {
+                for (let i = 1; i <= 8; i++) {
+                    const button = document.createElement('button');
+                    button.className = 'relay-button off';
+                    button.id = `${board}-relay-${i}`;
+                    button.innerHTML = `
+                        DC ${dcNumber}
+                        <div class="led-indicator red" id="${board}-led-${i}"></div>
+                    `;
+                    button.onclick = () => toggleRelay(board, i, dcNumber);
+                    container.appendChild(button);
+                    relayStates[board][i] = false;
+                    dcNumber++;
+                }
+            }
+        }
+        
+        // Toggle relay
+        async function toggleRelay(board, relay, dcNum) {
+            try {
+                const response = await fetch(`/api/relay/${board}/${relay}/toggle`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    relayStates[board][relay] = data.state;
+                    updateRelayButton(board, relay, data.state);
+                    updateLEDDisplay(board, relay, data.state);
+                    updateStatus(`DC ${dcNum || ((board === 'board1' ? 0 : 8) + relay)}: ${data.state ? 'ON' : 'OFF'}`);
+                }
+            } catch (error) {
+                updateStatus(`Error: ${error.message}`, true);
+            }
+        }
+        
+        // Set all relays
+        async function setAllRelays(state) {
+            try {
+                // Set board 1
+                await fetch('/api/relay/board1/all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state: state })
+                });
+                
+                // Set board 2
+                await fetch('/api/relay/board2/all', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state: state })
+                });
+                
+                // Update all buttons
+                for (let board of ['board1', 'board2']) {
+                    for (let i = 1; i <= 8; i++) {
+                        relayStates[board][i] = state;
+                        updateRelayButton(board, i, state);
+                        updateLEDDisplay(board, i, state);
+                    }
+                }
+                
+                updateStatus(`All DC outputs: ${state ? 'ON' : 'OFF'}`);
+            } catch (error) {
+                updateStatus(`Error: ${error.message}`, true);
+            }
+        }
+        
+        // Update relay button appearance
+        function updateRelayButton(board, relay, state) {
+            const button = document.getElementById(`${board}-relay-${relay}`);
+            const ledIndicator = document.getElementById(`${board}-led-${relay}`);
+            
+            if (state) {
+                button.classList.remove('off');
+                button.classList.add('on');
+                ledIndicator.classList.remove('red');
+                ledIndicator.classList.add('green');
+            } else {
+                button.classList.remove('on');
+                button.classList.add('off');
+                ledIndicator.classList.remove('green');
+                ledIndicator.classList.add('red');
+            }
+        }
+        
+        // Update LED indicator on relay button
+        function updateLEDDisplay(board, relay, state) {
+            // This function now only updates the LED indicator on the button
+            // The actual LED strip update happens on the Arduino side
+        }
+        
+        // Test sequence
+        async function testSequence() {
+            updateStatus('Running test sequence...');
+            
+            for (let board of ['board1', 'board2']) {
+                for (let i = 1; i <= 8; i++) {
+                    await toggleRelay(board, i);
+                    await new Promise(r => setTimeout(r, 300));
+                }
+            }
+            
+            // Turn all off
+            await new Promise(r => setTimeout(r, 500));
+            await toggleAllRelays('board1', false);
+            await toggleAllRelays('board2', false);
+            
+            updateStatus('Test sequence complete');
+        }
+        
+        // Emergency stop
+        async function emergencyStop() {
+            await setAllRelays(false);
+            updateStatus('EMERGENCY STOP - All DC outputs OFF', true);
+        }
+        
+        // Update status message
+        function updateStatus(message, isError = false) {
+            const status = document.getElementById('status');
+            const timestamp = new Date().toLocaleTimeString();
+            status.textContent = `[${timestamp}] Status: ${message}`;
+            status.style.background = isError ? '#ffebee' : '#e8f5e9';
+        }
+        
+        // Check Arduino connection
+        async function checkConnection() {
+            try {
+                const response = await fetch('/api/system/status');
+                const data = await response.json();
+                
+                const statusDiv = document.getElementById('connection-status');
+                if (data.serial_connected) {
+                    statusDiv.className = 'control-panel connection-status connected';
+                    statusDiv.textContent = '✓ Arduino Connected on ' + data.uart_port;
+                } else {
+                    statusDiv.className = 'control-panel connection-status disconnected';
+                    statusDiv.textContent = '✗ Arduino Not Connected';
+                }
+            } catch (error) {
+                console.error('Connection check failed:', error);
+            }
+        }
+        
+        // Load current relay states
+        async function loadRelayStates() {
+            try {
+                const response = await fetch('/api/relay/status');
+                const data = await response.json();
+                
+                for (let board in data) {
+                    for (let relay in data[board]) {
+                        relayStates[board][relay] = data[board][relay];
+                        updateRelayButton(board, parseInt(relay), data[board][relay]);
+                        updateLEDDisplay(board, parseInt(relay), data[board][relay]);
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load relay states:', error);
+            }
+        }
+        
+        // Initialize on load
+        window.onload = () => {
+            initializeRelays();
+            loadRelayStates();
+            checkConnection();
+            
+            // Check connection every 5 seconds
+            setInterval(checkConnection, 5000);
+        };
+    </script>
+</body>
+</html>
+"""
+
+def init_gpio():
+    """Initialize all GPIO pins for relays"""
+    for board in RELAY_PINS.values():
+        for pin in board.values():
+            try:
+                # Export GPIO if not already exported
+                gpio_path = f"/sys/class/gpio/gpio{pin}"
+                if not os.path.exists(gpio_path):
+                    with open('/sys/class/gpio/export', 'w') as f:
+                        f.write(str(pin))
+                
+                time.sleep(0.05)  # Small delay for filesystem
+                
+                # Set direction to output
+                direction_path = f"{gpio_path}/direction"
+                if os.path.exists(direction_path):
+                    with open(direction_path, 'w') as f:
+                        f.write('out')
+                
+                # Initialize to OFF (active-HIGH relays - 0 = OFF, 1 = ON)
+                value_path = f"{gpio_path}/value"
+                if os.path.exists(value_path):
+                    with open(value_path, 'w') as f:
+                        f.write('0')  # 0 = OFF for active-high relays
+                        
+            except Exception as e:
+                print(f"Failed to initialize GPIO {pin}: {e}")
+
+def init_serial():
+    """Initialize serial connection to Arduino"""
+    global arduino_serial
+    try:
+        # Close existing connection if any
+        if arduino_serial and arduino_serial.is_open:
+            arduino_serial.close()
+            time.sleep(0.5)
+        
+        arduino_serial = serial.Serial(
+            port=UART_PORT,
+            baudrate=UART_BAUDRATE,
+            timeout=1,
+            write_timeout=1
+        )
+        
+        # Clear any pending data
+        arduino_serial.reset_input_buffer()
+        arduino_serial.reset_output_buffer()
+        
+        time.sleep(2)  # Wait for Arduino to reset
+        
+        print(f"Serial connection established on {UART_PORT} at {UART_BAUDRATE} baud")
+        return True
+    except Exception as e:
+        print(f"Failed to initialize serial: {e}")
+        arduino_serial = None
+        return False
+
+def send_arduino_command(command):
+    """Send simple character command to Arduino via serial"""
+    global arduino_serial
+    
+    try:
+        with serial_lock:
+            if not arduino_serial or not arduino_serial.is_open:
+                print("Serial port not open, attempting to reconnect...")
+                if not init_serial():
+                    return False
+            
+            # Send simple character command
+            print(f"Sending to Arduino: {command}")
+            arduino_serial.write(command.encode())
+            arduino_serial.flush()
+            
+            time.sleep(0.01)
+            return True
+    except Exception as e:
+        print(f"Failed to send command to Arduino: {e}")
+        arduino_serial = None
+        return False
+
+def set_relay(board, relay, state):
+    """Set relay state and update corresponding LED"""
+    if board not in RELAY_PINS or relay not in RELAY_PINS[board]:
+        return False
+    
+    pin = RELAY_PINS[board][relay]
+    gpio_path = f"/sys/class/gpio/gpio{pin}/value"
+    
+    try:
+        with open(gpio_path, 'w') as f:
+            # For active-HIGH relays: 1 = ON, 0 = OFF
+            f.write('1' if state else '0')
+        
+        relay_states[board][relay] = state
+        
+        # Update corresponding LED
+        led_index = get_led_for_relay(board, relay)
+        if led_index is not None:
+            # Send individual LED commands
+            # Format: "L" + led_number + "G" for green (ON) or "R" for red (OFF)
+            if led_index < 10:
+                cmd = f"{led_index}"
+            else:
+                cmd = chr(ord('A') + led_index - 10)
+            
+            if state:
+                cmd += "G"  # Green for ON
+            else:
+                cmd += "R"  # Red for OFF
+            
+            if not send_arduino_command(cmd):
+                print(f"Warning: Failed to update LED {led_index} for relay {board}/{relay}")
+        
+        return True
+    except Exception as e:
+        print(f"Failed to set relay {board}/{relay}: {e}")
+        return False
+
+def sync_all_leds():
+    """Sync all LED colors with relay states"""
+    print("Syncing all LEDs with relay states...")
+    
+    # Send sync command to set all LEDs based on relay states
+    for board in relay_states:
+        for relay, state in relay_states[board].items():
+            led_index = get_led_for_relay(board, relay)
+            if led_index is not None:
+                if led_index < 10:
+                    cmd = f"{led_index}"
+                else:
+                    cmd = chr(ord('A') + led_index - 10)
+                
+                if state:
+                    cmd += "G"  # Green for ON
+                else:
+                    cmd += "R"  # Red for OFF
+                
+                send_arduino_command(cmd)
+                time.sleep(0.02)
+    
+    print("LED sync complete")
+
+@app.route('/')
+def index():
+    """Main control panel"""
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/relay/<board>/<int:relay>/toggle', methods=['POST'])
+def toggle_relay(board, relay):
+    """Toggle a specific relay"""
+    current_state = relay_states.get(board, {}).get(relay, False)
+    new_state = not current_state
+    
+    if set_relay(board, relay, new_state):
+        return jsonify({
+            'success': True,
+            'board': board,
+            'relay': relay,
+            'state': new_state
+        })
+    else:
+        return jsonify({'success': False, 'error': 'Failed to toggle relay'}), 500
+
+@app.route('/api/relay/<board>/all', methods=['POST'])
+def set_all_relays(board):
+    """Set all relays on a board to the same state"""
+    data = request.get_json()
+    state = data.get('state', False)
+    
+    if board not in RELAY_PINS:
+        return jsonify({'success': False, 'error': 'Invalid board'}), 400
+    
+    success = True
+    for relay in RELAY_PINS[board].keys():
+        if not set_relay(board, relay, state):
+            success = False
+    
+    return jsonify({
+        'success': success,
+        'board': board,
+        'state': state
+    })
+
+@app.route('/api/relay/status')
+def get_relay_status():
+    """Get current status of all relays"""
+    return jsonify(relay_states)
+
+@app.route('/api/led/sync', methods=['POST'])
+def sync_leds():
+    """Sync all LEDs with current relay states"""
+    sync_all_leds()
+    return jsonify({'success': True, 'message': 'LEDs synced with relay states'})
+
+@app.route('/api/led/test', methods=['POST'])
+def test_leds():
+    """Test LED functionality"""
+    # Send test command
+    send_arduino_command('t')
+    return jsonify({'success': True, 'message': 'LED test started'})
+
+@app.route('/api/system/status')
+def system_status():
+    """Get system status"""
+    return jsonify({
+        'timestamp': datetime.now().isoformat(),
+        'serial_connected': arduino_serial is not None and arduino_serial.is_open,
+        'relay_boards': 2,
+        'total_relays': 16,
+        'total_leds': 16,
+        'uart_port': UART_PORT,
+        'uart_baudrate': UART_BAUDRATE
+    })
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("RV1106 Control System Starting...")
+    print("=" * 60)
+    
+    # Initialize GPIO pins
+    print("Initializing GPIO pins for relays...")
+    init_gpio()
+    print("✓ GPIO initialization complete")
+    
+    # Initialize serial connection
+    print(f"Connecting to Arduino on {UART_PORT} at {UART_BAUDRATE} baud...")
+    if init_serial():
+        print("✓ Serial connection established")
+        
+        # Wait for Arduino to be ready
+        print("Waiting for Arduino to be ready...")
+        time.sleep(2)
+        
+        # Initialize all LEDs to red (relays are off by default)
+        print("Initializing LED states...")
+        sync_all_leds()
+        print("✓ LEDs initialized")
+    else:
+        print("✗ Serial connection failed - LED control will not work")
+    
+    print("-" * 60)
+    print("Server starting on port 80")
+    print("Access the control panel at: http://<your-rv1106-ip>")
+    print("Press Ctrl+C to stop")
+    print("=" * 60)
+    
+    try:
+        app.run(
+            host='0.0.0.0',
+            port=80,
+            debug=False,
+            threaded=True
+        )
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        if arduino_serial and arduino_serial.is_open:
+            arduino_serial.close()
+        print("Server stopped.")
+    except Exception as e:
+        print(f"Error: {e}")
