@@ -1,288 +1,214 @@
 /*
  * Arduino Nano WS2812B LED Controller
+ * Controls 16 LEDs based on relay states
  * Receives commands from RV1106 via Serial (9600 baud)
- * Controls 17 WS2812B LEDs
  * 
- * Required Library: FastLED (install via Arduino Library Manager)
+ * Commands:
+ * r/R - All red (all relays OFF)
+ * g/G - All green (all relays ON)
+ * b/B - All blue (test)
+ * w/W - All white (test)
+ * o/O - All off
+ * t/T - Test pattern
+ * 0-9 - Control LED 0-9
+ * A-F - Control LED 10-15
+ * Following the LED number:
+ *   G - Green (relay ON)
+ *   R - Red (relay OFF)
  */
 
-#include <FastLED.h>
-#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
 
-// LED Configuration
-#define LED_PIN     6        // Data pin for WS2812B (change if needed)
-#define NUM_LEDS    17       // Number of LEDs
-#define LED_TYPE    WS2812B
-#define COLOR_ORDER GRB
-#define BRIGHTNESS  128      // Default brightness (0-255)
+#define LED_PIN     6
+#define NUM_LEDS    16
+#define BRIGHTNESS  128
 
-// Create LED array
-CRGB leds[NUM_LEDS];
-
-// Animation variables
-unsigned long lastUpdate = 0;
-int animationStep = 0;
-String currentAnimation = "none";
-CRGB animationColor = CRGB::Red;
-
-// Serial communication buffer
-StaticJsonDocument<200> doc;
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 void setup() {
-  // Initialize Serial communication
+  // Initialize Serial
   Serial.begin(9600);
-  while (!Serial) {
-    ; // Wait for serial port to connect
+  
+  // Initialize LED strip
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
+  strip.clear();
+  strip.show();
+  
+  // Startup animation - 3 white flashes
+  for(int i = 0; i < 3; i++) {
+    setAllLEDs(255, 255, 255);
+    delay(200);
+    strip.clear();
+    strip.show();
+    delay(200);
   }
   
-  // Initialize FastLED
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  FastLED.setBrightness(BRIGHTNESS);
-  FastLED.clear();
-  FastLED.show();
-  
-  // Startup animation
-  startupAnimation();
+  // Set all LEDs to red (all relays OFF by default)
+  setAllLEDs(255, 0, 0);
   
   Serial.println("Arduino LED Controller Ready");
+  Serial.println("16 LEDs for 16 relays");
 }
 
 void loop() {
-  // Check for serial commands
-  if (Serial.available()) {
-    String jsonString = Serial.readStringUntil('\n');
-    processCommand(jsonString);
-  }
+  static int ledIndex = -1;
   
-  // Update animations
-  updateAnimations();
-}
-
-void processCommand(String jsonString) {
-  // Parse JSON command
-  DeserializationError error = deserializeJson(doc, jsonString);
-  
-  if (error) {
-    Serial.print("JSON parsing failed: ");
-    Serial.println(error.c_str());
-    return;
-  }
-  
-  const char* cmd = doc["cmd"];
-  
-  if (strcmp(cmd, "clear") == 0) {
-    // Clear all LEDs
-    FastLED.clear();
-    FastLED.show();
-    currentAnimation = "none";
-    Serial.println("LEDs cleared");
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
     
-  } else if (strcmp(cmd, "fill") == 0) {
-    // Fill all LEDs with color
-    int r = doc["r"] | 0;
-    int g = doc["g"] | 0;
-    int b = doc["b"] | 0;
-    
-    fill_solid(leds, NUM_LEDS, CRGB(r, g, b));
-    FastLED.show();
-    currentAnimation = "none";
-    Serial.println("LEDs filled");
-    
-  } else if (strcmp(cmd, "pixel") == 0) {
-    // Set individual pixel
-    int index = doc["index"] | 0;
-    int r = doc["r"] | 0;
-    int g = doc["g"] | 0;
-    int b = doc["b"] | 0;
-    
-    if (index >= 0 && index < NUM_LEDS) {
-      leds[index] = CRGB(r, g, b);
-      FastLED.show();
-      Serial.print("Pixel ");
-      Serial.print(index);
-      Serial.println(" set");
+    // Check if this is a LED index (0-9 or A-F)
+    if (cmd >= '0' && cmd <= '9') {
+      ledIndex = cmd - '0';
+      return;  // Wait for next character (G or R)
+    }
+    else if (cmd >= 'A' && cmd <= 'F') {
+      ledIndex = 10 + (cmd - 'A');
+      return;  // Wait for next character (G or R)
     }
     
-  } else if (strcmp(cmd, "rainbow") == 0) {
-    // Start rainbow animation
-    currentAnimation = "rainbow";
-    animationStep = 0;
-    Serial.println("Rainbow animation started");
-    
-  } else if (strcmp(cmd, "chase") == 0) {
-    // Start chase animation
-    int r = doc["r"] | 255;
-    int g = doc["g"] | 0;
-    int b = doc["b"] | 0;
-    
-    currentAnimation = "chase";
-    animationColor = CRGB(r, g, b);
-    animationStep = 0;
-    Serial.println("Chase animation started");
-    
-  } else if (strcmp(cmd, "fade") == 0) {
-    // Start fade animation
-    currentAnimation = "fade";
-    animationStep = 0;
-    Serial.println("Fade animation started");
-    
-  } else if (strcmp(cmd, "sparkle") == 0) {
-    // Start sparkle animation
-    currentAnimation = "sparkle";
-    Serial.println("Sparkle animation started");
-    
-  } else if (strcmp(cmd, "brightness") == 0) {
-    // Set brightness
-    int brightness = doc["value"] | 128;
-    FastLED.setBrightness(constrain(brightness, 0, 255));
-    FastLED.show();
-    Serial.print("Brightness set to ");
-    Serial.println(brightness);
-    
-  } else {
-    Serial.print("Unknown command: ");
-    Serial.println(cmd);
-  }
-}
-
-void updateAnimations() {
-  unsigned long currentMillis = millis();
-  
-  if (currentAnimation == "rainbow") {
-    // Rainbow animation
-    if (currentMillis - lastUpdate > 20) {
-      rainbowAnimation();
-      lastUpdate = currentMillis;
-    }
-    
-  } else if (currentAnimation == "chase") {
-    // Chase animation
-    if (currentMillis - lastUpdate > 100) {
-      chaseAnimation();
-      lastUpdate = currentMillis;
-    }
-    
-  } else if (currentAnimation == "fade") {
-    // Fade animation
-    if (currentMillis - lastUpdate > 30) {
-      fadeAnimation();
-      lastUpdate = currentMillis;
-    }
-    
-  } else if (currentAnimation == "sparkle") {
-    // Sparkle animation
-    if (currentMillis - lastUpdate > 50) {
-      sparkleAnimation();
-      lastUpdate = currentMillis;
-    }
-  }
-}
-
-void rainbowAnimation() {
-  // Fill the entire strip with rainbow colors
-  fill_rainbow(leds, NUM_LEDS, animationStep, 255 / NUM_LEDS);
-  FastLED.show();
-  animationStep = (animationStep + 1) % 256;
-}
-
-void chaseAnimation() {
-  // Clear all LEDs
-  fadeToBlackBy(leds, NUM_LEDS, 60);
-  
-  // Light up LEDs in sequence
-  int pos = animationStep % NUM_LEDS;
-  leds[pos] = animationColor;
-  
-  // Add a tail effect
-  if (pos > 0) {
-    leds[pos - 1] = animationColor;
-    leds[pos - 1].fadeToBlackBy(128);
-  }
-  
-  FastLED.show();
-  animationStep++;
-}
-
-void fadeAnimation() {
-  // Fade all LEDs in and out
-  int brightness = 0;
-  
-  if (animationStep < 128) {
-    brightness = animationStep * 2;
-  } else {
-    brightness = (255 - animationStep) * 2;
-  }
-  
-  fill_solid(leds, NUM_LEDS, CRGB::White);
-  FastLED.setBrightness(brightness);
-  FastLED.show();
-  
-  animationStep = (animationStep + 2) % 256;
-}
-
-void sparkleAnimation() {
-  // Fade all LEDs slightly
-  fadeToBlackBy(leds, NUM_LEDS, 20);
-  
-  // Add random sparkles
-  if (random(100) < 30) {
-    int pos = random(NUM_LEDS);
-    leds[pos] = CRGB::White;
-  }
-  
-  FastLED.show();
-}
-
-void startupAnimation() {
-  // Quick startup animation to show LEDs are working
-  for (int i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CRGB::Green;
-    FastLED.show();
-    delay(30);
-  }
-  
-  delay(500);
-  
-  for (int i = NUM_LEDS - 1; i >= 0; i--) {
-    leds[i] = CRGB::Black;
-    FastLED.show();
-    delay(30);
-  }
-}
-
-// Function to set custom patterns (can be expanded)
-void setPattern(String pattern) {
-  if (pattern == "christmas") {
-    for (int i = 0; i < NUM_LEDS; i++) {
-      if (i % 2 == 0) {
-        leds[i] = CRGB::Red;
-      } else {
-        leds[i] = CRGB::Green;
+    // If we have a LED index waiting, this should be G or R
+    if (ledIndex >= 0 && ledIndex < NUM_LEDS) {
+      if (cmd == 'G' || cmd == 'g') {
+        // Green - relay ON
+        strip.setPixelColor(ledIndex, strip.Color(0, 255, 0));
+        strip.show();
+        Serial.print("LED ");
+        Serial.print(ledIndex);
+        Serial.println(" -> GREEN (ON)");
       }
+      else if (cmd == 'R' || cmd == 'r') {
+        // Red - relay OFF
+        strip.setPixelColor(ledIndex, strip.Color(255, 0, 0));
+        strip.show();
+        Serial.print("LED ");
+        Serial.print(ledIndex);
+        Serial.println(" -> RED (OFF)");
+      }
+      ledIndex = -1;  // Reset
+      return;
     }
-    FastLED.show();
     
-  } else if (pattern == "police") {
-    // Police light pattern
-    static bool toggle = false;
-    if (toggle) {
-      fill_solid(leds, NUM_LEDS/2, CRGB::Red);
-      fill_solid(leds + NUM_LEDS/2, NUM_LEDS - NUM_LEDS/2, CRGB::Blue);
-    } else {
-      fill_solid(leds, NUM_LEDS/2, CRGB::Blue);
-      fill_solid(leds + NUM_LEDS/2, NUM_LEDS - NUM_LEDS/2, CRGB::Red);
+    // Process single character commands
+    switch(cmd) {
+      case 'r':
+      case 'R':
+        if (ledIndex < 0) {  // Only if not waiting for G/R
+          Serial.println("All LEDs -> RED");
+          setAllLEDs(255, 0, 0);
+          ledIndex = -1;
+        }
+        break;
+        
+      case 'g':
+      case 'G':
+        if (ledIndex < 0) {  // Only if not waiting for G/R
+          Serial.println("All LEDs -> GREEN");
+          setAllLEDs(0, 255, 0);
+          ledIndex = -1;
+        }
+        break;
+        
+      case 'b':
+      case 'B':
+        Serial.println("All LEDs -> BLUE");
+        setAllLEDs(0, 0, 255);
+        ledIndex = -1;
+        break;
+        
+      case 'w':
+      case 'W':
+        Serial.println("All LEDs -> WHITE");
+        setAllLEDs(255, 255, 255);
+        ledIndex = -1;
+        break;
+        
+      case 'o':
+      case 'O':
+        Serial.println("All LEDs -> OFF");
+        strip.clear();
+        strip.show();
+        ledIndex = -1;
+        break;
+        
+      case 't':
+      case 'T':
+        Serial.println("Running test pattern...");
+        testPattern();
+        ledIndex = -1;
+        break;
+        
+      case '\n':
+      case '\r':
+        // Ignore newlines
+        break;
+        
+      default:
+        if (cmd >= 32 && cmd <= 126) {  // Printable characters
+          Serial.print("Unknown: ");
+          Serial.println(cmd);
+        }
+        ledIndex = -1;
+        break;
     }
-    toggle = !toggle;
-    FastLED.show();
-    
-  } else if (pattern == "fire") {
-    // Simple fire effect
-    for (int i = 0; i < NUM_LEDS; i++) {
-      int r = 255;
-      int g = random(50, 255);
-      int b = 0;
-      leds[i] = CRGB(r, g, b);
-    }
-    FastLED.show();
   }
+}
+
+void setAllLEDs(uint8_t r, uint8_t g, uint8_t b) {
+  for(int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
+void testPattern() {
+  // Quick sweep through all colors
+  // Red sweep
+  for(int i = 0; i < NUM_LEDS; i++) {
+    strip.clear();
+    strip.setPixelColor(i, strip.Color(255, 0, 0));
+    strip.show();
+    delay(50);
+  }
+  
+  // Green sweep
+  for(int i = 0; i < NUM_LEDS; i++) {
+    strip.clear();
+    strip.setPixelColor(i, strip.Color(0, 255, 0));
+    strip.show();
+    delay(50);
+  }
+  
+  // Blue sweep
+  for(int i = 0; i < NUM_LEDS; i++) {
+    strip.clear();
+    strip.setPixelColor(i, strip.Color(0, 0, 255));
+    strip.show();
+    delay(50);
+  }
+  
+  // Simulate relay states
+  // Board 1 ON, Board 2 OFF
+  for(int i = 0; i < 8; i++) {
+    strip.setPixelColor(i, strip.Color(0, 255, 0));
+  }
+  for(int i = 8; i < 16; i++) {
+    strip.setPixelColor(i, strip.Color(255, 0, 0));
+  }
+  strip.show();
+  delay(1000);
+  
+  // Board 1 OFF, Board 2 ON
+  for(int i = 0; i < 8; i++) {
+    strip.setPixelColor(i, strip.Color(255, 0, 0));
+  }
+  for(int i = 8; i < 16; i++) {
+    strip.setPixelColor(i, strip.Color(0, 255, 0));
+  }
+  strip.show();
+  delay(1000);
+  
+  // All back to red (OFF)
+  setAllLEDs(255, 0, 0);
+  Serial.println("Test complete");
 }
